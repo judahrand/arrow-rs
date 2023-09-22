@@ -399,6 +399,7 @@ impl Codec {
 
                 let owned = OwnedRow {
                     data: nulls.buffer.into(),
+                    offsets: nulls.column_offsets.first().unwrap()[..].into(),
                     config: nulls.config,
                 };
                 Ok(Self::Dictionary(converter, owned))
@@ -436,6 +437,7 @@ impl Codec {
                 let nulls = converter.convert_columns(&nulls)?;
                 let owned = OwnedRow {
                     data: nulls.buffer.into(),
+                    offsets: nulls.column_offsets.first().unwrap()[..].into(),
                     config: nulls.config,
                 };
 
@@ -641,7 +643,19 @@ impl RowConverter {
             .collect::<Result<Vec<_>, _>>()?;
 
         let write_offset = rows.num_rows();
-        let lengths = row_lengths(columns, &encoders);
+        let lengths = column_lengths(columns, &encoders);
+
+        // These are offsets within the row's data buffer.
+        for (row_idx, col_lengths) in lengths.iter().enumerate() {
+            rows.column_offsets.reserve(columns.len() + 1);
+            rows.column_offsets[row_idx].push(0);
+
+            let mut cur_offset = 0_usize;
+            for l in col_lengths {
+                cur_offset = cur_offset.checked_add(*l).expect("overflow");
+                rows.column_offsets[row_idx].push(cur_offset);
+            }
+        }
 
         // We initialize the offsets shifted down by one row index.
         //
@@ -662,7 +676,7 @@ impl RowConverter {
         let mut cur_offset = rows.offsets[write_offset];
         for l in lengths {
             rows.offsets.push(cur_offset);
-            cur_offset = cur_offset.checked_add(l).expect("overflow");
+            cur_offset = cur_offset.checked_add(l.iter().sum()).expect("overflow");
         }
 
         // Note this will not zero out any trailing data in `rows.buffer`,
@@ -755,6 +769,7 @@ impl RowConverter {
 
         Rows {
             offsets,
+            column_offsets: vec![vec![]; row_capacity],
             buffer: Vec::with_capacity(data_capacity),
             config: RowConfig {
                 fields: self.fields.clone(),
@@ -819,6 +834,7 @@ impl RowParser {
     pub fn parse<'a>(&'a self, bytes: &'a [u8]) -> Row<'a> {
         Row {
             data: bytes,
+            offsets: &[0],
             config: &self.config,
         }
     }
@@ -842,6 +858,8 @@ pub struct Rows {
     buffer: Vec<u8>,
     /// Row `i` has data `&buffer[offsets[i]..offsets[i+1]]`
     offsets: Vec<usize>,
+    /// Column `j` of row `i` has data `&buffer[offsets[i]..offsets[i+1]][column_offsets[i][j]..column_offsets[i][j+1]]`
+    column_offsets: Vec<Vec<usize>>,
     /// The config for these rows
     config: RowConfig,
 }
@@ -864,6 +882,7 @@ impl Rows {
         let start = self.offsets[row];
         Row {
             data: &self.buffer[start..end],
+            offsets: &self.column_offsets[row],
             config: &self.config,
         }
     }
@@ -962,6 +981,7 @@ impl<'a> DoubleEndedIterator for RowsIter<'a> {
 #[derive(Debug, Copy, Clone)]
 pub struct Row<'a> {
     data: &'a [u8],
+    offsets: &'a [usize],
     config: &'a RowConfig,
 }
 
@@ -970,8 +990,15 @@ impl<'a> Row<'a> {
     pub fn owned(&self) -> OwnedRow {
         OwnedRow {
             data: self.data.into(),
+            offsets: self.offsets.into(),
             config: self.config.clone(),
         }
+    }
+
+    pub fn column(&self, column: usize) -> &[u8] {
+        let start = self.offsets[column];
+        let end = self.offsets[column + 1];
+        &self.data[start..end]
     }
 }
 
@@ -1020,6 +1047,7 @@ impl<'a> AsRef<[u8]> for Row<'a> {
 #[derive(Debug, Clone)]
 pub struct OwnedRow {
     data: Box<[u8]>,
+    offsets: Box<[usize]>,
     config: RowConfig,
 }
 
@@ -1030,6 +1058,7 @@ impl OwnedRow {
     pub fn row(&self) -> Row<'_> {
         Row {
             data: &self.data,
+            offsets: &self.offsets,
             config: &self.config,
         }
     }
@@ -1084,42 +1113,42 @@ fn null_sentinel(options: SortOptions) -> u8 {
 }
 
 /// Computes the length of each encoded [`Rows`] and returns an empty [`Rows`]
-fn row_lengths(cols: &[ArrayRef], encoders: &[Encoder]) -> Vec<usize> {
+fn column_lengths(cols: &[ArrayRef], encoders: &[Encoder]) -> Vec<Vec<usize>> {
     use fixed::FixedLengthEncoding;
 
+    let num_columns = cols.len();
     let num_rows = cols.first().map(|x| x.len()).unwrap_or(0);
-    let mut lengths = vec![0; num_rows];
-
+    let mut lengths = vec![Vec::with_capacity(num_columns); num_rows];
     for (array, encoder) in cols.iter().zip(encoders) {
         match encoder {
             Encoder::Stateless => {
                 downcast_primitive_array! {
-                    array => lengths.iter_mut().for_each(|x| *x += fixed::encoded_len(array)),
-                    DataType::Null => {},
-                    DataType::Boolean => lengths.iter_mut().for_each(|x| *x += bool::ENCODED_LEN),
+                    array => lengths.iter_mut().for_each(|x| x.push(fixed::encoded_len(array))),
+                    DataType::Null => {lengths.iter_mut().for_each(|x| x.push(0))},
+                    DataType::Boolean => lengths.iter_mut().for_each(|x| x.push(bool::ENCODED_LEN)),
                     DataType::Binary => as_generic_binary_array::<i32>(array)
                         .iter()
                         .zip(lengths.iter_mut())
-                        .for_each(|(slice, length)| *length += variable::encoded_len(slice)),
+                        .for_each(|(slice, length)| length.push(variable::encoded_len(slice))),
                     DataType::LargeBinary => as_generic_binary_array::<i64>(array)
                         .iter()
                         .zip(lengths.iter_mut())
-                        .for_each(|(slice, length)| *length += variable::encoded_len(slice)),
+                        .for_each(|(slice, length)| length.push(variable::encoded_len(slice))),
                     DataType::Utf8 => array.as_string::<i32>()
                         .iter()
                         .zip(lengths.iter_mut())
                         .for_each(|(slice, length)| {
-                            *length += variable::encoded_len(slice.map(|x| x.as_bytes()))
+                            length.push(variable::encoded_len(slice.map(|x| x.as_bytes())))
                         }),
                     DataType::LargeUtf8 => array.as_string::<i64>()
                         .iter()
                         .zip(lengths.iter_mut())
                         .for_each(|(slice, length)| {
-                            *length += variable::encoded_len(slice.map(|x| x.as_bytes()))
+                            length.push(variable::encoded_len(slice.map(|x| x.as_bytes())))
                         }),
                     DataType::FixedSizeBinary(len) => {
                         let len = len.to_usize().unwrap();
-                        lengths.iter_mut().for_each(|x| *x += 1 + len)
+                        lengths.iter_mut().for_each(|x| x.push(1 + len))
                     }
                     _ => unreachable!(),
                 }
@@ -1128,10 +1157,10 @@ fn row_lengths(cols: &[ArrayRef], encoders: &[Encoder]) -> Vec<usize> {
                 downcast_dictionary_array! {
                     array => {
                         for (v, length) in array.keys().iter().zip(lengths.iter_mut()) {
-                            *length += match v {
+                            length.push(match v {
                                 Some(k) => values.row(k.as_usize()).data.len(),
                                 None => null.data.len(),
-                            }
+                            })
                         }
                     }
                     _ => unreachable!(),
@@ -1139,19 +1168,34 @@ fn row_lengths(cols: &[ArrayRef], encoders: &[Encoder]) -> Vec<usize> {
             }
             Encoder::Struct(rows, null) => {
                 let array = as_struct_array(array);
-                lengths.iter_mut().enumerate().for_each(|(idx, length)| {
-                    match array.is_valid(idx) {
-                        true => *length += 1 + rows.row(idx).as_ref().len(),
-                        false => *length += 1 + null.data.len(),
-                    }
-                });
+                lengths
+                    .iter_mut()
+                    .enumerate()
+                    .for_each(|(row_idx, length)| match array.is_valid(row_idx) {
+                        true => length.push(1 + rows.row(row_idx).as_ref().len()),
+                        false => length.push(1 + null.data.len()),
+                    });
             }
             Encoder::List(rows) => match array.data_type() {
                 DataType::List(_) => {
-                    list::compute_lengths(&mut lengths, rows, as_list_array(array))
+                    let mut x = vec![0; num_rows];
+                    list::compute_lengths(&mut x, rows, as_list_array(array));
+                    lengths
+                        .iter_mut()
+                        .enumerate()
+                        .for_each(|(row_idx, length)| {
+                            length.push(x[row_idx]);
+                        });
                 }
                 DataType::LargeList(_) => {
-                    list::compute_lengths(&mut lengths, rows, as_large_list_array(array))
+                    let mut x = vec![0; num_rows];
+                    list::compute_lengths(&mut x, rows, as_large_list_array(array));
+                    lengths
+                        .iter_mut()
+                        .enumerate()
+                        .for_each(|(row_idx, length)| {
+                            length.push(x[row_idx]);
+                        });
                 }
                 _ => unreachable!(),
             },
@@ -1371,6 +1415,18 @@ mod tests {
 
         assert_eq!(rows.offsets, &[0, 8, 16, 24, 32, 40, 48, 56]);
         assert_eq!(
+            rows.column_offsets,
+            &[
+                [0, 3, 8],
+                [0, 3, 8],
+                [0, 3, 8],
+                [0, 3, 8],
+                [0, 3, 8],
+                [0, 3, 8],
+                [0, 3, 8],
+            ]
+        );
+        assert_eq!(
             rows.buffer,
             &[
                 1, 128, 1, //
@@ -1395,6 +1451,18 @@ mod tests {
         assert!(rows.row(3) < rows.row(0));
         assert!(rows.row(4) < rows.row(1));
         assert!(rows.row(5) < rows.row(4));
+
+        assert!(rows.row(3).column(0) < rows.row(6).column(0));
+        assert!(rows.row(0).column(0) < rows.row(1).column(0));
+        assert!(rows.row(3).column(0) < rows.row(0).column(0));
+        assert!(rows.row(4).column(0) == rows.row(1).column(0));
+        assert!(rows.row(5).column(0) == rows.row(4).column(0));
+
+        assert!(rows.row(3).column(1) > rows.row(6).column(1));
+        assert!(rows.row(0).column(1) < rows.row(1).column(1));
+        assert!(rows.row(3).column(1) > rows.row(0).column(1));
+        assert!(rows.row(4).column(1) < rows.row(1).column(1));
+        assert!(rows.row(5).column(1) < rows.row(4).column(1));
 
         let back = converter.convert_rows(&rows).unwrap();
         for (expected, actual) in cols.iter().zip(&back) {
@@ -1425,6 +1493,7 @@ mod tests {
         let rows = converter.convert_columns(&[Arc::clone(&col)]).unwrap();
         for i in 0..rows.num_rows() - 1 {
             assert!(rows.row(i) < rows.row(i + 1));
+            assert!(rows.row(i).column(0) < rows.row(i + 1).column(0));
         }
 
         let back = converter.convert_rows(&rows).unwrap();
@@ -1457,6 +1526,7 @@ mod tests {
         let rows = converter.convert_columns(&[Arc::clone(&col)]).unwrap();
         for i in 0..rows.num_rows() - 1 {
             assert!(rows.row(i) < rows.row(i + 1));
+            assert!(rows.row(i).column(0) < rows.row(i + 1).column(0));
         }
 
         let back = converter.convert_rows(&rows).unwrap();
@@ -1477,6 +1547,10 @@ mod tests {
         assert!(rows.row(2) > rows.row(0));
         assert!(rows.row(1) > rows.row(0));
 
+        assert!(rows.row(2).column(0) > rows.row(1).column(0));
+        assert!(rows.row(2).column(0) > rows.row(0).column(0));
+        assert!(rows.row(1).column(0) > rows.row(0).column(0));
+
         let cols = converter.convert_rows(&rows).unwrap();
         assert_eq!(&cols[0], &col);
 
@@ -1493,6 +1567,9 @@ mod tests {
         assert!(rows.row(2) < rows.row(1));
         assert!(rows.row(2) < rows.row(0));
         assert!(rows.row(1) < rows.row(0));
+        assert!(rows.row(2).column(0) < rows.row(1).column(0));
+        assert!(rows.row(2).column(0) < rows.row(0).column(0));
+        assert!(rows.row(1).column(0) < rows.row(0).column(0));
         let cols = converter.convert_rows(&rows).unwrap();
         assert_eq!(&cols[0], &col);
     }
@@ -1541,6 +1618,7 @@ mod tests {
         let rows = converter.convert_columns(&[col]).unwrap();
         assert_eq!(rows.num_rows(), 10);
         assert_eq!(rows.row(1).data.len(), 0);
+        assert_eq!(rows.row(1).column(0).len(), 0);
     }
 
     #[test]
@@ -1560,6 +1638,11 @@ mod tests {
         assert!(rows.row(2) < rows.row(4));
         assert!(rows.row(3) < rows.row(0));
         assert!(rows.row(3) < rows.row(1));
+
+        assert!(rows.row(1).column(0) < rows.row(0).column(0));
+        assert!(rows.row(2).column(0) < rows.row(4).column(0));
+        assert!(rows.row(3).column(0) < rows.row(0).column(0));
+        assert!(rows.row(3).column(0) < rows.row(1).column(0));
 
         let cols = converter.convert_rows(&rows).unwrap();
         assert_eq!(&cols[0], &col);
@@ -1598,6 +1681,14 @@ mod tests {
                     rows.row(i),
                     rows.row(j)
                 );
+                assert!(
+                    rows.row(i).column(0) < rows.row(j).column(0),
+                    "{} < {} - {:?} < {:?}",
+                    i,
+                    j,
+                    rows.row(i).column(0),
+                    rows.row(j).column(0)
+                );
             }
         }
 
@@ -1623,6 +1714,14 @@ mod tests {
                     j,
                     rows.row(i),
                     rows.row(j)
+                );
+                assert!(
+                    rows.row(i).column(0) > rows.row(j).column(0),
+                    "{} < {} - {:?} < {:?}",
+                    i,
+                    j,
+                    rows.row(i).column(0),
+                    rows.row(j).column(0)
                 );
             }
         }
@@ -1669,6 +1768,15 @@ mod tests {
         assert_eq!(rows_a.row(1), rows_a.row(6));
         assert_eq!(rows_a.row(1), rows_a.row(7));
 
+        assert!(rows_a.row(3).column(0) < rows_a.row(5).column(0));
+        assert!(rows_a.row(2).column(0) < rows_a.row(1).column(0));
+        assert!(rows_a.row(0).column(0) < rows_a.row(1).column(0));
+        assert!(rows_a.row(3).column(0) < rows_a.row(0).column(0));
+
+        assert_eq!(rows_a.row(1).column(0), rows_a.row(4).column(0));
+        assert_eq!(rows_a.row(1).column(0), rows_a.row(6).column(0));
+        assert_eq!(rows_a.row(1).column(0), rows_a.row(7).column(0));
+
         let cols = converter.convert_rows(&rows_a).unwrap();
         dictionary_eq(&cols[0], &a);
 
@@ -1682,6 +1790,10 @@ mod tests {
         assert_eq!(rows_a.row(1), rows_b.row(0));
         assert_eq!(rows_a.row(3), rows_b.row(1));
         assert!(rows_b.row(2) < rows_a.row(0));
+
+        assert_eq!(rows_a.row(1).column(0), rows_b.row(0).column(0));
+        assert_eq!(rows_a.row(3).column(0), rows_b.row(1).column(0));
+        assert!(rows_b.row(2).column(0) < rows_a.row(0).column(0));
 
         let cols = converter.convert_rows(&rows_b).unwrap();
         dictionary_eq(&cols[0], &b);
@@ -1701,6 +1813,11 @@ mod tests {
         assert!(rows_c.row(0) > rows_c.row(1));
         assert!(rows_c.row(3) > rows_c.row(0));
 
+        assert!(rows_c.row(3).column(0) > rows_c.row(5).column(0));
+        assert!(rows_c.row(2).column(0) > rows_c.row(1).column(0));
+        assert!(rows_c.row(0).column(0) > rows_c.row(1).column(0));
+        assert!(rows_c.row(3).column(0) > rows_c.row(0).column(0));
+
         let cols = converter.convert_rows(&rows_c).unwrap();
         dictionary_eq(&cols[0], &a);
 
@@ -1718,6 +1835,11 @@ mod tests {
         assert!(rows_c.row(2) > rows_c.row(1));
         assert!(rows_c.row(0) > rows_c.row(1));
         assert!(rows_c.row(3) < rows_c.row(0));
+
+        assert!(rows_c.row(3).column(0) < rows_c.row(5).column(0));
+        assert!(rows_c.row(2).column(0) > rows_c.row(1).column(0));
+        assert!(rows_c.row(0).column(0) > rows_c.row(1).column(0));
+        assert!(rows_c.row(3).column(0) < rows_c.row(0).column(0));
 
         let cols = converter.convert_rows(&rows_c).unwrap();
         dictionary_eq(&cols[0], &a);
@@ -1738,6 +1860,7 @@ mod tests {
 
         for (a, b) in r1.iter().zip(r1.iter().skip(1)) {
             assert!(a < b);
+            assert!(a.column(0) < b.column(0));
         }
 
         let back = converter.convert_rows(&r1).unwrap();
@@ -1759,6 +1882,11 @@ mod tests {
         assert!(r2.row(0) < r2.row(1)); // Nulls first
         assert_ne!(r1.row(0), r2.row(0)); // Value does not equal null
         assert_eq!(r1.row(1), r2.row(1)); // Values equal
+
+        assert_eq!(r2.row(0).column(0), r2.row(2).column(0)); // Nulls equal
+        assert!(r2.row(0).column(0) < r2.row(1).column(0)); // Nulls first
+        assert_ne!(r1.row(0).column(0), r2.row(0).column(0)); // Value does not equal null
+        assert_eq!(r1.row(1).column(0), r2.row(1).column(0)); // Values equal
 
         let back = converter.convert_rows(&r2).unwrap();
         assert_eq!(back.len(), 1);
@@ -1790,6 +1918,12 @@ mod tests {
         assert!(rows.row(3) < rows.row(2));
         assert!(rows.row(6) < rows.row(2));
         assert!(rows.row(3) < rows.row(6));
+
+        assert!(rows.row(0).column(0) < rows.row(1).column(0));
+        assert!(rows.row(2).column(0) < rows.row(0).column(0));
+        assert!(rows.row(3).column(0) < rows.row(2).column(0));
+        assert!(rows.row(6).column(0) < rows.row(2).column(0));
+        assert!(rows.row(3).column(0) < rows.row(6).column(0));
     }
 
     #[test]
@@ -1818,6 +1952,11 @@ mod tests {
         assert_eq!(rows.row(3), rows.row(4));
         assert_eq!(rows.row(4), rows.row(5));
         assert!(rows.row(3) < rows.row(0));
+
+        assert_eq!(rows.row(0).column(0), rows.row(1).column(0));
+        assert_eq!(rows.row(3).column(0), rows.row(4).column(0));
+        assert_eq!(rows.row(4).column(0), rows.row(5).column(0));
+        assert!(rows.row(3).column(0) < rows.row(0).column(0));
     }
 
     #[test]
@@ -1881,6 +2020,13 @@ mod tests {
         assert!(rows.row(5) < rows.row(2)); // [] < [32, 42]
         assert!(rows.row(3) < rows.row(5)); // null < []
 
+        assert!(rows.row(0).column(0) > rows.row(1).column(0)); // [32, 52, 32] > [32, 52, 12]
+        assert!(rows.row(2).column(0) < rows.row(1).column(0)); // [32, 42] < [32, 52, 12]
+        assert!(rows.row(3).column(0) < rows.row(2).column(0)); // null < [32, 42]
+        assert!(rows.row(4).column(0) < rows.row(2).column(0)); // [32, null] < [32, 42]
+        assert!(rows.row(5).column(0) < rows.row(2).column(0)); // [] < [32, 42]
+        assert!(rows.row(3).column(0) < rows.row(5).column(0)); // null < []
+
         let back = converter.convert_rows(&rows).unwrap();
         assert_eq!(back.len(), 1);
         back[0].to_data().validate_full().unwrap();
@@ -1901,6 +2047,13 @@ mod tests {
         assert!(rows.row(5) < rows.row(2)); // [] < [32, 42]
         assert!(rows.row(3) > rows.row(5)); // null > []
 
+        assert!(rows.row(0).column(0) > rows.row(1).column(0)); // [32, 52, 32] > [32, 52, 12]
+        assert!(rows.row(2).column(0) < rows.row(1).column(0)); // [32, 42] < [32, 52, 12]
+        assert!(rows.row(3).column(0) > rows.row(2).column(0)); // null > [32, 42]
+        assert!(rows.row(4).column(0) > rows.row(2).column(0)); // [32, null] > [32, 42]
+        assert!(rows.row(5).column(0) < rows.row(2).column(0)); // [] < [32, 42]
+        assert!(rows.row(3).column(0) > rows.row(5).column(0)); // null > []
+
         let back = converter.convert_rows(&rows).unwrap();
         assert_eq!(back.len(), 1);
         back[0].to_data().validate_full().unwrap();
@@ -1921,6 +2074,13 @@ mod tests {
         assert!(rows.row(5) > rows.row(2)); // [] > [32, 42]
         assert!(rows.row(3) > rows.row(5)); // null > []
 
+        assert!(rows.row(0).column(0) < rows.row(1).column(0)); // [32, 52, 32] < [32, 52, 12]
+        assert!(rows.row(2).column(0) > rows.row(1).column(0)); // [32, 42] > [32, 52, 12]
+        assert!(rows.row(3).column(0) > rows.row(2).column(0)); // null > [32, 42]
+        assert!(rows.row(4).column(0) > rows.row(2).column(0)); // [32, null] > [32, 42]
+        assert!(rows.row(5).column(0) > rows.row(2).column(0)); // [] > [32, 42]
+        assert!(rows.row(3).column(0) > rows.row(5).column(0)); // null > []
+
         let back = converter.convert_rows(&rows).unwrap();
         assert_eq!(back.len(), 1);
         back[0].to_data().validate_full().unwrap();
@@ -1940,6 +2100,13 @@ mod tests {
         assert!(rows.row(4) < rows.row(2)); // [32, null] < [32, 42]
         assert!(rows.row(5) > rows.row(2)); // [] > [32, 42]
         assert!(rows.row(3) < rows.row(5)); // null < []
+
+        assert!(rows.row(0).column(0) < rows.row(1).column(0)); // [32, 52, 32] < [32, 52, 12]
+        assert!(rows.row(2).column(0) > rows.row(1).column(0)); // [32, 42] > [32, 52, 12]
+        assert!(rows.row(3).column(0) < rows.row(2).column(0)); // null < [32, 42]
+        assert!(rows.row(4).column(0) < rows.row(2).column(0)); // [32, null] < [32, 42]
+        assert!(rows.row(5).column(0) > rows.row(2).column(0)); // [] > [32, 42]
+        assert!(rows.row(3).column(0) < rows.row(5).column(0)); // null < []
 
         let back = converter.convert_rows(&rows).unwrap();
         assert_eq!(back.len(), 1);
@@ -2004,6 +2171,12 @@ mod tests {
         assert!(rows.row(4) < rows.row(0));
         assert!(rows.row(4) > rows.row(1));
 
+        assert!(rows.row(0).column(0) > rows.row(1).column(0));
+        assert!(rows.row(1).column(0) > rows.row(2).column(0));
+        assert!(rows.row(2).column(0) > rows.row(3).column(0));
+        assert!(rows.row(4).column(0) < rows.row(0).column(0));
+        assert!(rows.row(4).column(0) > rows.row(1).column(0));
+
         let back = converter.convert_rows(&rows).unwrap();
         assert_eq!(back.len(), 1);
         back[0].to_data().validate_full().unwrap();
@@ -2023,6 +2196,12 @@ mod tests {
         assert!(rows.row(4) > rows.row(0));
         assert!(rows.row(4) > rows.row(1));
 
+        assert!(rows.row(0).column(0) > rows.row(1).column(0));
+        assert!(rows.row(1).column(0) > rows.row(2).column(0));
+        assert!(rows.row(2).column(0) > rows.row(3).column(0));
+        assert!(rows.row(4).column(0) > rows.row(0).column(0));
+        assert!(rows.row(4).column(0) > rows.row(1).column(0));
+
         let back = converter.convert_rows(&rows).unwrap();
         assert_eq!(back.len(), 1);
         back[0].to_data().validate_full().unwrap();
@@ -2041,6 +2220,12 @@ mod tests {
         assert!(rows.row(2) < rows.row(3));
         assert!(rows.row(4) > rows.row(0));
         assert!(rows.row(4) < rows.row(1));
+
+        assert!(rows.row(0).column(0) < rows.row(1).column(0));
+        assert!(rows.row(1).column(0) < rows.row(2).column(0));
+        assert!(rows.row(2).column(0) < rows.row(3).column(0));
+        assert!(rows.row(4).column(0) > rows.row(0).column(0));
+        assert!(rows.row(4).column(0) < rows.row(1).column(0));
 
         let back = converter.convert_rows(&rows).unwrap();
         assert_eq!(back.len(), 1);
